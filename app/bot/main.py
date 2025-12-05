@@ -1,30 +1,25 @@
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 import asyncio
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from config import TOKEN
-from database import create_table_users, add_new_user, user_exists, create_table_food, create_table_log_food, add_food, get_food, log_food, get_day_log_food, create_table_search_log, add_search_log, search_log_exists, search_food
-import requests
-import datetime
+from app.core.config import BOT_TOKEN
+from app.db.crud import  add_new_user, user_exists, add_food, get_food, log_food, get_day_log_food, add_search_log, search_log_exists, search_food
+from app.db.models import create_table_food, create_table_log_food, create_table_search_log, create_table_users
+from api_client import FoodBotApi
 from aiogram.fsm.state import State, StatesGroup
-from pars import get_foods
-import numpy as np
+from app.parsers.pars import get_foods
+from functools import lru_cache
+from app.api.schemas import User
 import time
-
-
 class Form(StatesGroup):
     waiting_for_answer = State()
 
-
-bot = Bot(TOKEN)
+API_URL = "http://127.0.0.1:8000/"
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-
+api = FoodBotApi(base_url=API_URL)
 
 
 ####################
@@ -42,7 +37,11 @@ create_table_search_log()
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     await message.answer("Привет")
-    if user_exists(message.from_user.id): add_new_user(message.from_user.id, "ru")
+    await api.connect()
+    id = message.from_user.id
+    if not await api.user_exist(id):
+        await api.add_user({"id":id,"lang":"ru"})
+    await api.disconnect()
 
 
 
@@ -55,45 +54,26 @@ async def start_cmd(message: Message, state: FSMContext):
 
 
 
-@dp.message(Command("Day"))
-async def start_cmd(message: Message):
-    foods = get_day_log_food(message.from_user.id,"1")
-    res = foods[0][4:]
-    foods.pop(0)
-
-    for i in foods:
-        i = i[4:]
-        res[0] += i[0]
-        res[1] += i[1]
-        res[2] += i[2]
-        res[3] += i[3]
-        res[4] += i[4]
-
-    name = ["Ккал - ","Жиры - ","Углеводы - ","Белки - ", "Масса - "]
-    res = "".join([name[i]+str(int(res[i]))+"\n" for i in range(len(res))])
-
-    await message.answer(res)
-
-
-
-
+@lru_cache(maxsize=None)
 @dp.message(Form.waiting_for_answer)
 async def get_name(message: Message, state: FSMContext):
 
     mess = message.text.replace("-","").split()
     name = "".join(mess[:-1])
-    if search_log_exists(name):
+    flag = await api.search_log_exist(name)
+    if flag:
         try:
             if int(mess[-1]):
-                al = get_foods(name)
+                al = list(sorted(get_foods(name),key=lambda x:len(x["title"])))
+
                 add_food(al)
 
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text=f"{i['title']}", callback_data=f"{i['id']} {mess[-1]}")] for i in al[:15]] +
+                        [InlineKeyboardButton(text=f"{i['title']}", callback_data=f"{i['id']} {mess[-1]}")] for i in al[:8]] +
                         [[InlineKeyboardButton(text="Еще...", callback_data="lot")]] +
                         [[InlineKeyboardButton(text="Отмена", callback_data="stop")]])
 
-                add_search_log(message.from_user.id, name)
+                await api.add_search_log({"user_id":message.from_user.id,"date":int(time.time()),"mess":mess})
 
                 await message.answer("Выбери Вариант:",reply_markup=keyboard)
                 await state.clear()
@@ -102,8 +82,9 @@ async def get_name(message: Message, state: FSMContext):
             await message.answer("Попробуйте ещё раз")
 
     else:
-        al = list(search_food(name))
-
+        await api.connect()
+        foods = (await api.search_food(name))["message"]
+        al = list(sorted(foods,key=lambda x:len(x[1])))
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text=f"{i[1]}", callback_data=f"{i[0]} {mess[-1]}")] for i in al[:15]] +
                         [[InlineKeyboardButton(text="Еще...", callback_data="lot")]] +
@@ -111,6 +92,7 @@ async def get_name(message: Message, state: FSMContext):
 
         await message.answer("Выбери Вариант:", reply_markup=keyboard)
         await state.clear()
+        await api.disconnect()
 
 
 
@@ -127,24 +109,33 @@ async def handler_callback(callback: CallbackQuery):
         return
 
     data = data.split()
+    await api.connect()
+    food = (await api.get_food(data[0]))["message"]
 
-    food = get_food(data[0])
 
     for i in range(len(food)):
         if type(food[i])==float:
             food[i]*=int(data[-1])/100
 
-    log_food(food,data[-1],callback.from_user.id)
+    await api.log_food_ent({"id":food[0],"user_id":callback.from_user.id, "date":int(time.time()), "name":food[1], "energy":food[2], "fat":food[3], "carbohydrate":food[4], "protein":food[5],"mass":data[-1]})
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer('Добавлено✨')
+    await api.disconnect()
 
+
+
+@dp.message(Command("Day"))
+async def start_cmd(message: Message):
+    await api.connect()
+    res = await api.get_day_log_food(user_id = message.from_user.id, date = 1)
+    await api.disconnect()
+    await message.answer(res["message"])
 
 
 
 async def main():
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
