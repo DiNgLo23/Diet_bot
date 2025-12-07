@@ -1,4 +1,4 @@
-# Database - только Food.db не включать
+# Database 
 data/Food.db
 
 # Python cache
